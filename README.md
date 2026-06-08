@@ -21,16 +21,17 @@ errs = model.standard_errors(responses)
 
 ## Benchmark
 
-`theta` and [`girth`](https://github.com/eribean/girth) fit the **same** 2PL
-model by the **same** method — Marginal Maximum Likelihood on a 61-point
-Gauss–Hermite grid — so this is apples-to-apples. They recover **identical
-parameters** (Pearson r = 1.000 on both discrimination and difficulty at every
-size); `theta` is **15–50× faster**, and the gap widens with scale.
+`theta` and [`girth`](https://github.com/eribean/girth) fit the **same** model by
+the **same** method — Marginal Maximum Likelihood on a 61-point Gauss–Hermite
+grid — so this is apples-to-apples. At every size both libraries **converge** and
+recover **identical parameters** (Pearson r = 1.000), so the speed is not bought
+with a worse fit. CPU (Apple M-series), `Q = 61`, warm (JIT already compiled);
+log scale, lower is better. Reproduce with
+`uv run --group bench python bench/compare.py`.
+
+### 2PL — `theta` is 15–50× faster, and the gap widens with scale
 
 ![2PL calibration: theta vs girth](https://raw.githubusercontent.com/vuciv/theta/main/bench/benchmark.png)
-
-> Calibrating a 2PL model. CPU (Apple M-series), `Q = 61` quadrature nodes,
-> warm (steady-state — JIT already compiled). Log scale; lower is better.
 
 | size (persons × items) | theta | girth | speedup | param agreement (a, b) |
 |---|--:|--:|--:|--:|
@@ -39,9 +40,23 @@ size); `theta` is **15–50× faster**, and the gap widens with scale.
 | 20,000 × 100  | **0.44 s** | 22.9 s  | **52×** | 1.000, 1.000 |
 | 50,000 × 100  | **1.0 s**  | 47.6 s  | **47×** | 1.000, 1.000 |
 
-Reproduce with `uv run --group bench python bench/compare.py`.
+### 1PL — converges everywhere, faster at scale
 
-**Scaling on its own** (theta, 2PL, 50 items, warm): **100k** persons in 0.9 s,
+`theta`'s 1PL estimates a single shared discrimination plus per-item difficulty.
+girth's 1PL/Rasch routine is lightweight, so the two are roughly even on small
+problems; `theta` pulls ahead as the matrix grows (up to ~5× at 50k×100). Every
+fit **converges** (32–50 EM iterations) and matches girth's parameters exactly.
+
+![1PL calibration: theta vs girth](https://raw.githubusercontent.com/vuciv/theta/main/bench/benchmark_1pl.png)
+
+| size (persons × items) | theta | girth | speedup | converged | param agreement (a, b) |
+|---|--:|--:|--:|:--:|--:|
+| 1,000 × 50    | 80 ms      | **58 ms** | 0.7×    | yes (37 it) | 1.000, 1.000 |
+| 5,000 × 50    | **96 ms**  | 174 ms    | **1.8×** | yes (32 it) | 1.000, 1.000 |
+| 20,000 × 100  | **0.46 s** | 1.5 s     | **3.2×** | yes (49 it) | 0.999, 1.000 |
+| 50,000 × 100  | **0.89 s** | 4.7 s     | **5.3×** | yes (50 it) | 0.999, 1.000 |
+
+**`theta` scaling on its own** (2PL, 50 items, warm): **100k** persons in 0.9 s,
 **500k** in 4.8 s — roughly **5M responses/s** on a laptop CPU, and the identical
 code runs on GPU through the `cuda` extra. The first fit of a given shape pays a
 one-time XLA compile (~0.5–1 s); every fit after is warm.
