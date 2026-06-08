@@ -27,7 +27,7 @@ Gauss–Hermite grid — so this is apples-to-apples. They recover **identical
 parameters** (Pearson r = 1.000 on both discrimination and difficulty at every
 size); `theta` is **15–50× faster**, and the gap widens with scale.
 
-![2PL calibration: theta vs girth](bench/benchmark.png)
+![2PL calibration: theta vs girth](https://raw.githubusercontent.com/vuciv/theta/main/bench/benchmark.png)
 
 > Calibrating a 2PL model. CPU (Apple M-series), `Q = 61` quadrature nodes,
 > warm (steady-state — JIT already compiled). Log scale; lower is better.
