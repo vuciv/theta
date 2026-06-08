@@ -1,6 +1,6 @@
 [project]
 name = "theta-irt"
-version = "0.1.0"
+version = "0.1.1"
 description = "The fastest IRT library: JAX-accelerated MMLE-EM for 1PL/2PL/3PL/4PL"
 readme = "README.md"
 requires-python = ">=3.10"
