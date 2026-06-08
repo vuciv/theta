@@ -9,8 +9,9 @@ so 1PL/2PL are plain MMLE. The 3PL/4PL asymptotes (c, d) carry light Beta priors
 by default because their likelihood is nearly flat; that makes those fits MAP /
 penalized-MML in c and d unless the priors are disabled (see `theta.priors`).
 
-Everything except the Python convergence driver is JIT-compiled, so the hot
-loop runs as fused XLA kernels (CPU or GPU).
+The whole EM loop is JIT-compiled: the convergence iteration runs on-device via
+``jax.lax.while_loop``, so the hot loop is fused XLA kernels (CPU or GPU) with no
+per-iteration host synchronization (no ``float(mll)`` device->host stall).
 """
 
 from __future__ import annotations
@@ -195,6 +196,45 @@ def _prior_sum(psi, spec: ModelSpec, priors: Priors):
     return s
 
 
+@partial(jax.jit, static_argnums=(6, 7, 8, 10))
+def _em_loop(psi, Xm, Om, Mobs, log_weights, nodes,
+             spec: ModelSpec, priors: Priors, max_iter: int, tol, n_newton: int):
+    """JIT-compiled MML-EM fixed point: the whole convergence loop on-device.
+
+    A ``lax.while_loop`` runs E-step -> M-step -> max-abs-change test each
+    iteration with no host synchronization, so consecutive iterations stay
+    pipelined as fused XLA kernels instead of stalling on a per-iteration
+    ``float(mll)`` device->host copy. The marginal log-likelihood and penalized
+    objective are written into preallocated ``[max_iter]`` buffers, so the driver
+    reconstructs the exact same history it always returned at the cost of one
+    device->host transfer after the loop rather than three per iteration.
+
+    Returns ``(psi, n_iter, converged, mll_buf, obj_buf)``; the buffers hold valid
+    entries in ``[:n_iter]``, each recorded at the psi *before* its M-step.
+    """
+    report0 = jnp.stack(M.natural_to_report(*M.psi_to_natural(psi, spec)), axis=0)
+
+    def cond(state):
+        it, _psi, _prev, converged, _mll, _obj = state
+        return (it < max_iter) & jnp.logical_not(converged)
+
+    def body(state):
+        it, psi, prev_report, _conv, mll_buf, obj_buf = state
+        rT, NbarT, mll = _e_step(psi, Xm, Om, Mobs, log_weights, spec, nodes)
+        # record at the *current* psi, before this iteration's M-step
+        mll_buf = mll_buf.at[it].set(mll)
+        obj_buf = obj_buf.at[it].set(mll + _prior_sum(psi, spec, priors))
+        psi = _m_step(psi, rT, NbarT, nodes, spec, priors, n_newton)
+        report = jnp.stack(M.natural_to_report(*M.psi_to_natural(psi, spec)), axis=0)
+        delta = jnp.max(jnp.abs(report - prev_report))
+        return (it + 1, psi, report, delta < tol, mll_buf, obj_buf)
+
+    init = (jnp.array(0, jnp.int32), psi, report0, jnp.array(False),
+            jnp.zeros(max_iter), jnp.zeros(max_iter))
+    it, psi, _report, converged, mll_buf, obj_buf = jax.lax.while_loop(cond, body, init)
+    return psi, it, converged, mll_buf, obj_buf
+
+
 # --------------------------------------------------------------------------
 # initialization + driver
 # --------------------------------------------------------------------------
@@ -266,33 +306,22 @@ def calibrate(
 
     psi = _init_psi(X, Mobs_np, spec)
 
-    prev = M.natural_to_report(*M.psi_to_natural(psi, spec))
-    prev_report = jnp.stack(prev, axis=0)
-    history = []
-    obj_history = []
-    converged = False
-    n_done = max_iter
-    for it in range(max_iter):
-        rT, NbarT, mll = _e_step(psi, Xm, Om, Mobs, log_weights, spec, nodes)
-        # record both at the *current* psi (before this iteration's M-step)
-        history.append(float(mll))
-        obj_history.append(float(mll) + float(_prior_sum(psi, spec, priors)))
-        psi = _m_step(psi, rT, NbarT, nodes, spec, priors, n_newton)
+    # The whole convergence loop runs on-device (lax.while_loop): no per-iter
+    # float()/host-sync, so XLA keeps the E/M kernels pipelined. The history
+    # buffers come back in a single device->host transfer after the loop.
+    psi, n_it, converged, mll_buf, obj_buf = _em_loop(
+        psi, Xm, Om, Mobs, log_weights, nodes, spec, priors, max_iter, tol, n_newton
+    )
+    n_done = int(n_it)
+    converged = bool(converged)
 
-        report = jnp.stack(M.natural_to_report(*M.psi_to_natural(psi, spec)), axis=0)
-        delta = float(jnp.max(jnp.abs(report - prev_report)))
-        prev_report = report
-        if delta < tol:
-            converged = True
-            n_done = it + 1
-            break
-
-    # The per-iteration mll above is evaluated *before* that iteration's M-step,
-    # so it lags the returned psi. Evaluate the marginal log-likelihood at the
-    # final parameters so `loglik` (and AIC/BIC) match what we return.
+    # The per-iteration mll is recorded *before* that iteration's M-step, so it
+    # lags the returned psi. Evaluate the marginal log-likelihood at the final
+    # parameters so `loglik` (and AIC/BIC) match what we return.
     _, _, final_mll = _e_step(psi, Xm, Om, Mobs, log_weights, spec, nodes)
-    history.append(float(final_mll))
-    obj_history.append(float(final_mll) + float(_prior_sum(psi, spec, priors)))
+    final_obj = final_mll + _prior_sum(psi, spec, priors)
+    history = [float(x) for x in np.asarray(mll_buf)[:n_done]] + [float(final_mll)]
+    obj_history = [float(x) for x in np.asarray(obj_buf)[:n_done]] + [float(final_obj)]
 
     a, b, c, d = M.natural_to_report(*M.psi_to_natural(psi, spec))
     return CalibrateResult(
