@@ -21,40 +21,43 @@ errs = model.standard_errors(responses)
 
 ## Benchmark
 
-`theta` and [`girth`](https://github.com/eribean/girth) fit the **same** model by
-the **same** method — Marginal Maximum Likelihood on a 61-point Gauss–Hermite
-grid — so this is apples-to-apples. At every size both libraries **converge** and
-recover **identical parameters** (Pearson r = 1.000), so the speed is not bought
-with a worse fit. CPU (Apple M-series), `Q = 61`, warm (JIT already compiled);
-log scale, lower is better. Reproduce with
+`theta`, [`girth`](https://github.com/eribean/girth) (numpy/scipy), and
+[`mirt`](https://github.com/philchalmers/mirt) (R, C++ — the field's reference
+implementation) fit the **same** model by the **same** method: Marginal Maximum
+Likelihood on a 61-point Gauss–Hermite grid. So this is apples-to-apples, and
+all three **converge** to **identical parameters** (Pearson r = 1.000 against
+both) — the speed is not bought with a worse fit. `theta` beats the optimized
+C++ reference by **4–18×** on 2PL. CPU (Apple M-series), `Q = 61`, warm (JIT
+already compiled); log scale, lower is better. Reproduce with
 `uv run --group bench python bench/compare.py`.
 
-### 2PL — `theta` is 15–50× faster, and the gap widens with scale
+### 2PL — `theta` is 4–18× faster than mirt, 15–46× faster than girth
 
-![2PL calibration: theta vs girth](https://raw.githubusercontent.com/vuciv/theta/main/bench/benchmark.png)
+![2PL calibration: theta vs girth vs mirt](https://raw.githubusercontent.com/vuciv/theta/main/bench/benchmark.png)
 
-| size (persons × items) | theta | girth | speedup | param agreement (a, b) |
-|---|--:|--:|--:|--:|
-| 1,000 × 50    | **61 ms**  | 923 ms  | **15×** | 1.000, 1.000 |
-| 5,000 × 50    | **88 ms**  | 2.3 s   | **26×** | 1.000, 1.000 |
-| 20,000 × 100  | **0.44 s** | 22.9 s  | **52×** | 1.000, 1.000 |
-| 50,000 × 100  | **1.0 s**  | 47.6 s  | **47×** | 1.000, 1.000 |
+| size (persons × items) | theta | mirt (C++) | girth | vs mirt | vs girth |
+|---|--:|--:|--:|--:|--:|
+| 1,000 × 50    | **59 ms**  | 261 ms  | 888 ms  | **4.4×** | 15× |
+| 5,000 × 50    | **92 ms**  | 875 ms  | 2.3 s   | **9.5×** | 25× |
+| 20,000 × 100  | **0.51 s** | 6.4 s   | 23.4 s  | **12.5×** | 46× |
+| 50,000 × 100  | **1.1 s**  | 20.5 s  | 49.7 s  | **18.3×** | 44× |
 
-### 1PL — converges everywhere, faster at scale
+### 1PL — converges everywhere, 3–13× faster than mirt
 
-`theta`'s 1PL estimates a single shared discrimination plus per-item difficulty.
-girth's 1PL/Rasch routine is lightweight, so the two are roughly even on small
-problems; `theta` pulls ahead as the matrix grows (up to ~5× at 50k×100). Every
-fit **converges** (32–50 EM iterations) and matches girth's parameters exactly.
+`theta`'s 1PL estimates a single shared discrimination plus per-item difficulty
+(mirt fit with an equal-slopes constraint to match). Every fit **converges**
+(32–50 EM iterations) with parameters identical to both references. girth's
+1PL/Rasch routine is lightweight enough to edge `theta` on the smallest problem;
+`theta` pulls away with scale.
 
-![1PL calibration: theta vs girth](https://raw.githubusercontent.com/vuciv/theta/main/bench/benchmark_1pl.png)
+![1PL calibration: theta vs girth vs mirt](https://raw.githubusercontent.com/vuciv/theta/main/bench/benchmark_1pl.png)
 
-| size (persons × items) | theta | girth | speedup | converged | param agreement (a, b) |
-|---|--:|--:|--:|:--:|--:|
-| 1,000 × 50    | 80 ms      | **58 ms** | 0.7×    | yes (37 it) | 1.000, 1.000 |
-| 5,000 × 50    | **96 ms**  | 174 ms    | **1.8×** | yes (32 it) | 1.000, 1.000 |
-| 20,000 × 100  | **0.46 s** | 1.5 s     | **3.2×** | yes (49 it) | 0.999, 1.000 |
-| 50,000 × 100  | **0.89 s** | 4.7 s     | **5.3×** | yes (50 it) | 0.999, 1.000 |
+| size (persons × items) | theta | mirt (C++) | girth | vs mirt | converged |
+|---|--:|--:|--:|--:|:--:|
+| 1,000 × 50    | 85 ms      | 232 ms  | **61 ms** | **2.7×** | yes (37 it) |
+| 5,000 × 50    | **103 ms** | 430 ms  | 181 ms    | **4.2×** | yes (32 it) |
+| 20,000 × 100  | **0.50 s** | 4.2 s   | 1.6 s     | **8.4×** | yes (49 it) |
+| 50,000 × 100  | **1.05 s** | 13.8 s  | 8.3 s     | **13.1×** | yes (50 it) |
 
 **`theta` scaling on its own** (2PL, 50 items, warm): **100k** persons in 0.9 s,
 **500k** in 4.8 s — roughly **5M responses/s** on a laptop CPU, and the identical
@@ -104,7 +107,7 @@ git clone https://github.com/vuciv/theta && cd theta
 uv sync                                        # create .venv + install theta and deps
 uv run pytest                                  # run the test suite
 uv run python bench/benchmark.py               # scaling benchmark
-uv run --group bench python bench/compare.py   # head-to-head vs girth (+ chart)
+uv run --group bench python bench/compare.py   # vs girth (+ mirt if R/mirt installed)
 
 uv build                                       # wheel + sdist into dist/
 uv publish                                     # upload to PyPI (set UV_PUBLISH_TOKEN)

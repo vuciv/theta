@@ -1,19 +1,30 @@
-"""Head-to-head: theta vs girth on 1PL / 2PL Marginal Maximum Likelihood.
+"""Head-to-head: theta vs girth vs mirt on 1PL / 2PL Marginal Maximum Likelihood.
 
-Both libraries estimate the *same* model by the *same* method (MMLE on a
-Gauss-Hermite grid, point estimates) so this is an apples-to-apples wall-clock
-comparison. We also check that the two agree on the recovered parameters, so the
-speed number is not bought with a worse fit, and report theta's convergence.
+All three estimate the *same* model by the *same* method (MMLE-EM on a
+Gauss-Hermite grid, point estimates), so this is apples-to-apples:
+
+  * theta  — JAX, this package
+  * girth  — numpy/scipy (Python)
+  * mirt   — R, C++ (Rcpp); the field's reference implementation
+
+mirt runs out-of-process through bench/mirt_fit.R, which times the fit only
+(R startup and CSV IO are excluded, just as theta/girth exclude data loading).
+If Rscript or the mirt package is missing, mirt is skipped and the comparison
+falls back to theta vs girth.
 
   uv run --group bench python bench/compare.py            # both models
   uv run --group bench python bench/compare.py 1PL        # one model
 
-Writes bench/benchmark_<model>.png (and benchmark.png for 2PL) + a markdown table.
+Writes bench/benchmark_<model>.png (+ benchmark.png for 2PL) and a markdown table.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -28,17 +39,47 @@ except ImportError:  # pragma: no cover
 N_GRID = [(1_000, 50), (5_000, 50), (20_000, 100), (50_000, 100)]
 QUAD = 61
 REPEAT = 3
+_MIRT_R = os.path.join(os.path.dirname(__file__), "mirt_fit.R")
 
+
+# --- competitors -----------------------------------------------------------
 
 def _girth_fit(model, Rt):
-    """Return (a, b) from girth for the given model; a is length n_items."""
     opts = {"quadrature_n": QUAD}
     n_items = Rt.shape[0]
     if model == "1PL":
-        r = onepl_mml(Rt, options=opts)              # one shared discrimination
+        r = onepl_mml(Rt, options=opts)
         return np.full(n_items, float(r["Discrimination"])), np.asarray(r["Difficulty"])
     r = twopl_mml(Rt, options=opts)
     return np.asarray(r["Discrimination"]), np.asarray(r["Difficulty"])
+
+
+def _mirt_available():
+    if shutil.which("Rscript") is None:
+        return False
+    r = subprocess.run(["Rscript", "-e", 'cat(requireNamespace("mirt", quietly=TRUE))'],
+                       capture_output=True, text=True)
+    return "TRUE" in r.stdout
+
+
+def _mirt_fit(model, R):
+    """Returns (fit_time_seconds, a, b, converged) via the R harness."""
+    with tempfile.TemporaryDirectory() as d:
+        data_csv, out_csv = os.path.join(d, "data.csv"), os.path.join(d, "params.csv")
+        np.savetxt(data_csv, R.astype(int), fmt="%d", delimiter=",")
+        r = subprocess.run(
+            ["Rscript", _MIRT_R, data_csv, model, out_csv, str(QUAD), str(REPEAT)],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("mirt failed:\n" + r.stderr[-1500:])
+        t = conv = None
+        for line in r.stdout.splitlines():
+            if line.startswith("TIME "):
+                t = float(line.split()[1])
+            elif line.startswith("CONVERGED "):
+                conv = line.split()[1] == "TRUE"
+        p = np.genfromtxt(out_csv, delimiter=",", names=True)
+        return t, np.atleast_1d(p["a"]), np.atleast_1d(p["b"]), conv
 
 
 def _time(fn, repeat=REPEAT):
@@ -52,9 +93,13 @@ def _once(fn):
     return time.perf_counter() - t0
 
 
+# --- driver ----------------------------------------------------------------
+
 def run(models=("1PL", "2PL"), grid=N_GRID):
     if twopl_mml is None:
         raise SystemExit("girth not installed; run `uv add --group bench girth`")
+    has_mirt = _mirt_available()
+    print(f"competitors: theta, girth{', mirt' if has_mirt else '  (mirt unavailable, skipping)'}")
 
     for model in models:
         print(f"\n### {model}")
@@ -62,85 +107,100 @@ def run(models=("1PL", "2PL"), grid=N_GRID):
         for n, j in grid:
             sim = theta.simulate(n, j, model, seed=0)
             R = sim.responses
-            Rt = R.T.astype(np.int64)  # girth wants [items x participants]
+            Rt = R.T.astype(np.int64)
             out = {}
 
-            def fit_theta():
-                m = theta.fit(R, model, n_points=QUAD)
-                out["m"] = m
-
-            def fit_girth():
-                out["g"] = _girth_fit(model, Rt)
-
-            t_theta = _time(fit_theta)
-            t_girth = _time(fit_girth)
-
+            t_theta = _time(lambda: out.__setitem__("m", theta.fit(R, model, n_points=QUAD)))
+            t_girth = _time(lambda: out.__setitem__("g", _girth_fit(model, Rt)))
             m = out["m"]
-            a_t, b_t = np.asarray(m.a), np.asarray(m.b)
+            b_t = np.asarray(m.b)
             a_g, b_g = out["g"]
-            agree_b = float(np.corrcoef(b_t, b_g)[0, 1])
-            # 1PL slope is a single shared scalar -> compare values, not correlation
-            agree_a = (float(np.corrcoef(a_t, a_g)[0, 1]) if model != "1PL"
-                       else 1.0 - abs(a_t[0] - a_g[0]) / a_g[0])
+            row = dict(n=n, j=j, t_theta=t_theta, t_girth=t_girth,
+                       sp_girth=t_girth / t_theta, converged=m.converged, iters=m.n_iter,
+                       agree_girth=float(np.corrcoef(b_t, b_g)[0, 1]))
 
-            rows.append(dict(n=n, j=j, t_theta=t_theta, t_girth=t_girth,
-                             speedup=t_girth / t_theta, agree_a=agree_a, agree_b=agree_b,
-                             converged=m.converged, iters=m.n_iter))
-            aname = "a agree" if model != "1PL" else "a rel"
-            print(f"N={n:>6,} J={j:>3}: theta={t_theta*1e3:8.1f} ms  girth={t_girth*1e3:9.1f} ms  "
-                  f"{t_girth/t_theta:5.1f}x  conv={m.converged}/{m.n_iter:<3} "
-                  f"{aname}={agree_a:.3f} b corr={agree_b:.3f}")
+            if has_mirt:
+                t_m, a_m, b_m, conv_m = _mirt_fit(model, R)
+                row.update(t_mirt=t_m, sp_mirt=t_m / t_theta,
+                           agree_mirt=float(np.corrcoef(b_t, b_m)[0, 1]))
 
-        _print_table(model, rows)
-        path = f"bench/benchmark_{model.lower()}.png"
-        _make_chart(model, rows, path)
+            rows.append(row)
+            extra = (f"  mirt={row['t_mirt']*1e3:9.1f} ms ({row['sp_mirt']:.1f}x, "
+                     f"b corr={row['agree_mirt']:.3f})") if has_mirt else ""
+            print(f"N={n:>6,} J={j:>3}: theta={t_theta*1e3:8.1f} ms  "
+                  f"girth={t_girth*1e3:9.1f} ms ({row['sp_girth']:.1f}x)"
+                  f"{extra}  conv={m.converged}/{m.n_iter}")
+
+        _print_table(model, rows, has_mirt)
+        _make_chart(model, rows, f"bench/benchmark_{model.lower()}.png", has_mirt)
         if model == "2PL":
-            _make_chart(model, rows, "bench/benchmark.png")
+            _make_chart(model, rows, "bench/benchmark.png", has_mirt)
 
 
-def _print_table(model, rows):
-    print(f"\n| {model} size (N×J) | theta | girth | speedup | theta converged | param agreement (a, b) |")
-    print("|---|--:|--:|--:|:--:|--:|")
+def _print_table(model, rows, has_mirt):
+    head = "| size (N×J) | theta | girth | "
+    head += "mirt | " if has_mirt else ""
+    head += "speedup | converged | b agreement |"
+    print("\n" + head)
+    print("|---|--:|--:|" + ("--:|" if has_mirt else "") + "--:|:--:|--:|")
     for r in rows:
+        mirt_cell = f" {r['t_mirt']*1e3:.0f} ms |" if has_mirt else ""
+        if has_mirt:
+            sp = f"**{r['sp_mirt']:.1f}× vs mirt**, {r['sp_girth']:.0f}× vs girth"
+            agree = f"{r['agree_mirt']:.3f} (mirt), {r['agree_girth']:.3f} (girth)"
+        else:
+            sp = f"**{r['sp_girth']:.1f}×**"
+            agree = f"{r['agree_girth']:.3f}"
         print(f"| {r['n']:,} × {r['j']} | **{r['t_theta']*1e3:.0f} ms** | "
-              f"{r['t_girth']*1e3:.0f} ms | **{r['speedup']:.1f}×** | "
-              f"{'yes' if r['converged'] else 'NO'} ({r['iters']} it) | "
-              f"{r['agree_a']:.3f}, {r['agree_b']:.3f} |")
+              f"{r['t_girth']*1e3:.0f} ms |{mirt_cell} {sp} | "
+              f"{'yes' if r['converged'] else 'NO'} ({r['iters']} it) | {agree} |")
 
 
-def _make_chart(model, rows, path):
+def _make_chart(model, rows, path, has_mirt):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    labels = [f"{r['n']//1000}k×{r['j']}" for r in rows]
-    theta_ms = [r["t_theta"] * 1e3 for r in rows]
-    girth_ms = [r["t_girth"] * 1e3 for r in rows]
-    x = np.arange(len(labels))
-    w = 0.38
+    series = [("girth (numpy/scipy)", "t_girth", "#9aa0a6")]
+    if has_mirt:
+        series.append(("mirt (R / C++)", "t_mirt", "#f4a000"))
+    series.append(("theta (JAX)", "t_theta", "#2962ff"))
 
-    fig, ax = plt.subplots(figsize=(9, 4.6), dpi=140)
-    ax.bar(x - w / 2, girth_ms, w, label="girth (numpy/scipy MMLE)", color="#9aa0a6")
-    ax.bar(x + w / 2, theta_ms, w, label="theta (JAX MMLE)", color="#2962ff")
+    labels = [f"{r['n']//1000}k×{r['j']}" for r in rows]
+    x = np.arange(len(labels))
+    n = len(series)
+    w = 0.8 / n
+
+    fig, ax = plt.subplots(figsize=(9.4, 4.8), dpi=140)
+    for i, (label, key, color) in enumerate(series):
+        vals = [r[key] * 1e3 for r in rows]
+        ax.bar(x + (i - (n - 1) / 2) * w, vals, w, label=label, color=color)
+
+    # annotate theta with its speedup over the strongest baseline present (mirt)
+    base = "sp_mirt" if has_mirt else "sp_girth"
+    base_name = "mirt" if has_mirt else "girth"
+    theta_off = ((n - 1) - (n - 1) / 2) * w
+    for r, xi in zip(rows, x):
+        s = r[base]
+        if s >= 1.5:
+            txt, col = f"{s:.0f}× vs {base_name}", "#2962ff"
+        elif s >= 1.05:
+            txt, col = f"{s:.1f}× vs {base_name}", "#2962ff"
+        elif s >= 0.9:
+            txt, col = f"≈ {base_name}", "#5f6368"
+        else:
+            txt, col = f"{s:.1f}× ({base_name} wins)", "#5f6368"
+        ax.annotate(txt, (xi + theta_off, r["t_theta"] * 1e3), textcoords="offset points",
+                    xytext=(0, 5), ha="center", fontsize=7.5, color=col, fontweight="bold")
+
     ax.set_yscale("log")
     ax.set_ylabel(f"{model} fit time — ms (log scale, lower is better)")
     ax.set_xlabel("problem size  (persons × items)")
-    ax.set_title(f"{model} calibration: theta vs girth  (same MMLE, CPU, Q=61, warm)")
+    title = f"{model} calibration: theta vs girth" + (" vs mirt" if has_mirt else "")
+    ax.set_title(f"{title}  (same MMLE, CPU, Q=61, warm)")
     ax.set_xticks(x, labels)
-    ax.legend(frameon=False)
+    ax.legend(frameon=False, ncol=n)
     ax.spines[["top", "right"]].set_visible(False)
-    for r, xi, t in zip(rows, x, theta_ms):
-        s = r["speedup"]
-        if s >= 1.5:
-            txt, col = f"{s:.0f}× faster", "#2962ff"
-        elif s >= 1.1:
-            txt, col = f"{s:.1f}× faster", "#2962ff"
-        elif s >= 0.9:
-            txt, col = "≈ same", "#5f6368"
-        else:
-            txt, col = f"{s:.1f}× (girth wins)", "#5f6368"
-        ax.annotate(txt, (xi + w / 2, t), textcoords="offset points",
-                    xytext=(0, 5), ha="center", fontsize=8, color=col, fontweight="bold")
     fig.tight_layout()
     fig.savefig(path)
     print(f"wrote {path}")
