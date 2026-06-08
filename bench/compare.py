@@ -132,9 +132,9 @@ def run(models=("1PL", "2PL"), grid=N_GRID):
                   f"{extra}  conv={m.converged}/{m.n_iter}")
 
         _print_table(model, rows, has_mirt)
-        _make_chart(model, rows, f"bench/benchmark_{model.lower()}.png", has_mirt)
-        if model == "2PL":
-            _make_chart(model, rows, "bench/benchmark.png", has_mirt)
+        # 2PL is the headline chart (benchmark.png); other models get a suffix
+        path = "bench/benchmark.png" if model == "2PL" else f"bench/benchmark_{model.lower()}.png"
+        _make_chart(model, rows, path, has_mirt)
 
 
 def _print_table(model, rows, has_mirt):
