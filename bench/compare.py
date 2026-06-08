@@ -52,11 +52,10 @@ def _once(fn):
     return time.perf_counter() - t0
 
 
-def run(models=("2PL", "1PL"), grid=N_GRID):
+def run(models=("1PL", "2PL"), grid=N_GRID):
     if twopl_mml is None:
         raise SystemExit("girth not installed; run `uv add --group bench girth`")
 
-    per_model = {}
     for model in models:
         print(f"\n### {model}")
         rows = []
@@ -93,10 +92,10 @@ def run(models=("2PL", "1PL"), grid=N_GRID):
                   f"{aname}={agree_a:.3f} b corr={agree_b:.3f}")
 
         _print_table(model, rows)
-        per_model[model] = rows
-
-    _make_combined_chart(per_model, "bench/benchmark.png")
-    return per_model
+        path = f"bench/benchmark_{model.lower()}.png"
+        _make_chart(model, rows, path)
+        if model == "2PL":
+            _make_chart(model, rows, "bench/benchmark.png")
 
 
 def _print_table(model, rows):
@@ -109,52 +108,44 @@ def _print_table(model, rows):
               f"{r['agree_a']:.3f}, {r['agree_b']:.3f} |")
 
 
-_COLORS = {"2PL": "#2962ff", "1PL": "#00897b", "3PL": "#8e24aa", "4PL": "#f4511e"}
-
-
-def _make_combined_chart(per_model, path="bench/benchmark.png"):
-    """One chart: theta-over-girth speedup for every model across problem sizes.
-
-    Speedup = girth time / theta time (higher = theta faster). A dashed parity
-    line at 1x makes any point where girth wins read honestly.
-    """
+def _make_chart(model, rows, path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    models = list(per_model)
-    sizes = [f"{r['n']//1000}k×{r['j']}" for r in per_model[models[0]]]
-    x = np.arange(len(sizes))
-    n = len(models)
-    w = 0.8 / n
+    labels = [f"{r['n']//1000}k×{r['j']}" for r in rows]
+    theta_ms = [r["t_theta"] * 1e3 for r in rows]
+    girth_ms = [r["t_girth"] * 1e3 for r in rows]
+    x = np.arange(len(labels))
+    w = 0.38
 
-    fig, ax = plt.subplots(figsize=(9.2, 5.0), dpi=140)
-    for i, mdl in enumerate(models):
-        sp = [r["speedup"] for r in per_model[mdl]]
-        off = (i - (n - 1) / 2) * w
-        ax.bar(x + off, sp, w, label=mdl, color=_COLORS.get(mdl, "#888"))
-        for xi, s in zip(x + off, sp):
-            ax.annotate(f"{s:.0f}×" if s >= 1.5 else f"{s:.1f}×", (xi + off * 0, s),
-                        textcoords="offset points", xytext=(0, 3), ha="center",
-                        fontsize=8, fontweight="bold", color=_COLORS.get(mdl, "#888"))
-
-    ax.axhline(1.0, ls="--", lw=1, color="#9aa0a6")
-    ax.text(len(sizes) - 0.5, 1.0, " parity", va="center", ha="left",
-            fontsize=8, color="#9aa0a6")
+    fig, ax = plt.subplots(figsize=(9, 4.6), dpi=140)
+    ax.bar(x - w / 2, girth_ms, w, label="girth (numpy/scipy MMLE)", color="#9aa0a6")
+    ax.bar(x + w / 2, theta_ms, w, label="theta (JAX MMLE)", color="#2962ff")
     ax.set_yscale("log")
-    ax.set_ylim(0.5, max(r["speedup"] for rs in per_model.values() for r in rs) * 1.6)
-    ax.set_ylabel("speedup  =  girth time ÷ theta time   (higher = theta faster)")
+    ax.set_ylabel(f"{model} fit time — ms (log scale, lower is better)")
     ax.set_xlabel("problem size  (persons × items)")
-    ax.set_title("theta vs girth — same MMLE, CPU, Q=61, warm\n"
-                 "identical parameters (r = 1.000) and all fits converge at every size")
-    ax.set_xticks(x, sizes)
-    ax.legend(title="model", frameon=False)
+    ax.set_title(f"{model} calibration: theta vs girth  (same MMLE, CPU, Q=61, warm)")
+    ax.set_xticks(x, labels)
+    ax.legend(frameon=False)
     ax.spines[["top", "right"]].set_visible(False)
+    for r, xi, t in zip(rows, x, theta_ms):
+        s = r["speedup"]
+        if s >= 1.5:
+            txt, col = f"{s:.0f}× faster", "#2962ff"
+        elif s >= 1.1:
+            txt, col = f"{s:.1f}× faster", "#2962ff"
+        elif s >= 0.9:
+            txt, col = "≈ same", "#5f6368"
+        else:
+            txt, col = f"{s:.1f}× (girth wins)", "#5f6368"
+        ax.annotate(txt, (xi + w / 2, t), textcoords="offset points",
+                    xytext=(0, 5), ha="center", fontsize=8, color=col, fontweight="bold")
     fig.tight_layout()
     fig.savefig(path)
     print(f"wrote {path}")
 
 
 if __name__ == "__main__":
-    models = tuple(m.upper() for m in sys.argv[1:]) or ("2PL", "1PL")
+    models = tuple(m.upper() for m in sys.argv[1:]) or ("1PL", "2PL")
     run(models)
